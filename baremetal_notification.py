@@ -13,18 +13,24 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-
 import kombu
 from oslo_config import cfg
 from oslo_messaging._drivers import common
 from oslo_messaging import transport
 
-
-
 from tempest.api.baremetal.admin.base import BaseBaremetalTest
-from oslo_messaging._drivers import common
-from ironic_tempest_plugin.tests.scenario import baremetal_manager
 from ironic_tempest_plugin import clients
+
+
+BASIC_NOTIFICATIONS_NODE = [
+    'baremetal.node.create.success',
+    'baremetal.node.delete.success',
+    'baremetal.node.provision_set.success',
+    'baremetal.node.power_set.start',
+    'baremetal.node.power_set.end',
+    'baremetal.node.provision_set.start',
+    'baremetal.node.provision_set.end'
+]
 
 def get_url(conf):
     conf = conf.oslo_messaging_rabbit
@@ -33,13 +39,13 @@ def get_url(conf):
                                     conf.rabbit_host,
                                     conf.rabbit_port)
 class NotificationHandler(object):
-    def __init__(self, stack_id, events=None):
+    def __init__(self, uuid, events=None):
         self._notifications = []
-        self.stack_id = stack_id
+        self.uuid = uuid
 
     def process_message(self, body, message):
         notification = common.deserialize_msg(body)
-        if notification['payload']["ironic_object.data"]['uuid'] == self.stack_id:
+        if notification['payload']["ironic_object.data"]['uuid'] == self.uuid:
             self.notifications.append(notification['event_type'])
         message.ack()
 
@@ -69,22 +75,16 @@ class BaremetalNotifications(BaseBaremetalTest):
         super(BaremetalNotifications, cls).setup_clients()
         cls.baremetal_client = clients.Manager().baremetal_client
 
-    def test_baremetal_server_ops(self):
-        _, chassis = self.create_chassis()
-        _, node = self.create_node(chassis['uuid'])
-
+    def test_baremetal_notifications_node(self):
+        _, node = self.create_node(None)
+        provision_states_list = ['active', 'deleted']
+        self.baremetal_client.set_node_power_state(node['uuid'], 'power off')
+        for provision_state in provision_states_list:
+            self.baremetal_client.set_node_provision_state(node['uuid'],
+            provision_state)
+        self.delete_node(node['uuid'])
         handler = NotificationHandler(node['uuid'])
 
-
-        #import pdb; pdb.set_trace()
-        #print node
-        chassis_uuid = 'd504b075-740e-4e56-9782-f8ed1093c8d0'
-        #print
-        ## print self.baremetal_client.set_node_provision_state(node['uuid'], manage)
-        self.baremetal_client.update_node(node['uuid'], add=chassis_uuid)
-        #print
-        #print node
-        handler = NotificationHandler(chassis['uuid'])
         with self.conn.Consumer(self.queue,
                                 callbacks=[handler.process_message],
                                 auto_declare=False):
@@ -94,6 +94,5 @@ class BaremetalNotifications(BaseBaremetalTest):
             except Exception:
                 pass
 
-        print handler.notifications
-        ## for n in BASIC_NOTIFICATIONS:
-        ##     self.assertIn(n, handler.notifications)
+        for n in BASIC_NOTIFICATIONS_NODE:
+            self.assertIn(n, handler.notifications)
