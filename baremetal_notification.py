@@ -13,6 +13,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import socket
 import kombu
 from oslo_config import cfg
 from oslo_messaging._drivers import common
@@ -34,12 +35,13 @@ BASIC_NOTIFICATIONS_NODE = [
 
 def get_url(conf):
     conf = conf.oslo_messaging_rabbit
-    return 'amqp://%s:%s@%s:%s/' % (conf.rabbit_userid,
-                                    conf.rabbit_password,
-                                    conf.rabbit_host,
-                                    conf.rabbit_port)
+    return 'amqp://{0}:{1}@{2}:{3}/'.format(conf.rabbit_userid,
+                                            conf.rabbit_password,
+                                            conf.rabbit_host,
+                                            conf.rabbit_port)
 class NotificationHandler(object):
-    def __init__(self, uuid, events=None):
+
+    def __init__(self, uuid):
         self._notifications = []
         self.uuid = uuid
 
@@ -58,6 +60,8 @@ class NotificationHandler(object):
 
 
 class BaremetalNotifications(BaseBaremetalTest):
+    '''Tests for ironic notifications'''
+
     def setUp(self):
         super(BaremetalNotifications, self).setUp()
         self.exchange = kombu.Exchange('ironic', 'topic', durable=False)
@@ -66,8 +70,8 @@ class BaremetalNotifications(BaseBaremetalTest):
                             exclusive=True)
         self.conn = kombu.Connection(get_url(
             transport.get_transport(cfg.CONF).conf))
-        self.ch = self.conn.channel()
-        self.queue = queue(self.ch)
+        self.channel = self.conn.channel()
+        self.queue = queue(self.channel)
         self.queue.declare()
 
     @classmethod
@@ -76,7 +80,7 @@ class BaremetalNotifications(BaseBaremetalTest):
         cls.baremetal_client = clients.Manager().baremetal_client
 
     def test_baremetal_notifications_node(self):
-        _, node = self.create_node(None)
+        resp, node = self.create_node(None)
         provision_states_list = ['active', 'deleted']
         self.baremetal_client.set_node_power_state(node['uuid'], 'power off')
         for provision_state in provision_states_list:
@@ -91,8 +95,8 @@ class BaremetalNotifications(BaseBaremetalTest):
             try:
                 while True:
                     self.conn.drain_events(timeout=1)
-            except Exception:
+            except socket.timeout:
                 pass
 
-        for n in BASIC_NOTIFICATIONS_NODE:
-            self.assertIn(n, handler.notifications)
+        for notification in BASIC_NOTIFICATIONS_NODE:
+            self.assertIn(notification, handler.notifications)
