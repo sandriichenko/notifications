@@ -1,6 +1,3 @@
-#
-# Copyright 2014 Hewlett-Packard Development Company, L.P.
-#
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -20,6 +17,7 @@ from oslo_messaging._drivers import common
 from oslo_messaging import transport
 
 from tempest.api.baremetal.admin.base import BaseBaremetalTest
+from tempest.lib.common.utils import data_utils
 from ironic_tempest_plugin import clients
 
 
@@ -30,8 +28,20 @@ BASIC_NOTIFICATIONS_NODE = [
     'baremetal.node.power_set.start',
     'baremetal.node.power_set.end',
     'baremetal.node.provision_set.start',
-    'baremetal.node.provision_set.end'
+    'baremetal.node.provision_set.end',
+    'baremetal.node.maintenance_set.success'
 ]
+
+BASIC_NOTIFICATIONS_PORT = [
+    'baremetal.port.create.success',
+    'baremetal.port.delete.success'
+]
+
+BASIC_NOTIFICATIONS_CHASSIS = [
+    'baremetal.chassis.create.success',
+    'baremetal.chassis.delete.success'
+]
+
 
 def get_url(conf):
     conf = conf.oslo_messaging_rabbit
@@ -82,10 +92,14 @@ class BaremetalNotifications(BaseBaremetalTest):
     def test_baremetal_notifications_node(self):
         resp, node = self.create_node(None)
         provision_states_list = ['active', 'deleted']
+        instance_uuid = data_utils.rand_uuid()
+        self.baremetal_client.update_node(node['uuid'],
+                                          instance_uuid=instance_uuid)
         self.baremetal_client.set_node_power_state(node['uuid'], 'power off')
         for provision_state in provision_states_list:
             self.baremetal_client.set_node_provision_state(node['uuid'],
             provision_state)
+        self.baremetal_client.set_maintenance(node['uuid'])
         self.delete_node(node['uuid'])
         handler = NotificationHandler(node['uuid'])
 
@@ -97,6 +111,55 @@ class BaremetalNotifications(BaseBaremetalTest):
                     self.conn.drain_events(timeout=1)
             except socket.timeout:
                 pass
-
+        print handler.notifications
         for notification in BASIC_NOTIFICATIONS_NODE:
             self.assertIn(notification, handler.notifications)
+
+    def test_baremetal_notifications_chassis(self):
+        resp, chassis = self.create_chassis()
+        new_description = data_utils.rand_name('new-description')
+        self.baremetal_client.update_chassis(chassis['uuid'],
+                                             description=new_description)
+        self.baremetal_client.delete_chassis(chassis['uuid'])
+
+        handler = NotificationHandler(chassis['uuid'])
+
+        with self.conn.Consumer(self.queue,
+                                callbacks=[handler.process_message],
+                                auto_declare=False):
+            try:
+                while True:
+                    self.conn.drain_events(timeout=1)
+            except socket.timeout:
+                pass
+
+        for notification in BASIC_NOTIFICATIONS_CHASSIS:
+            self.assertIn(notification, handler.notifications)
+
+    def test_baremetal_notifications_port(self):
+        resp_node, node = self.create_node(None)
+        resp, port = self.create_port(node['uuid'],
+                                      data_utils.rand_mac_address())
+        patch = [{'path': '/extra/key1',
+                  'op': 'add',
+                  'value': {'key1': 'value1'}}]
+        self.baremetal_client.update_port(port['uuid'], patch)
+        self.delete_port(port['uuid'])
+
+        handler = NotificationHandler(port['uuid'])
+
+        with self.conn.Consumer(self.queue,
+                                callbacks=[handler.process_message],
+                                auto_declare=False):
+            try:
+                while True:
+                    self.conn.drain_events(timeout=1)
+            except socket.timeout:
+                pass
+        print handler.notifications
+        for notification in BASIC_NOTIFICATIONS_PORT:
+            self.assertIn(notification, handler.notifications)
+
+    def test_baremetal_notifications_test(self):
+        resp, node = self.create_node(None)
+        self.baremetal_client.set_maintenance(node['uuid'])
