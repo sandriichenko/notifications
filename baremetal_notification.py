@@ -12,6 +12,7 @@
 
 import socket
 import kombu
+import ddt
 from oslo_config import cfg
 from oslo_messaging._drivers import common
 from oslo_messaging import transport
@@ -20,28 +21,12 @@ from tempest.api.baremetal.admin.base import BaseBaremetalTest
 from tempest.lib.common.utils import data_utils
 from ironic_tempest_plugin import clients
 
-
-BASIC_NOTIFICATIONS_NODE = [
-    'baremetal.node.create.success',
-    'baremetal.node.delete.success',
-    'baremetal.node.provision_set.success',
-    'baremetal.node.power_set.start',
-    'baremetal.node.power_set.end',
-    'baremetal.node.provision_set.start',
-    'baremetal.node.provision_set.end',
-    'baremetal.node.maintenance_set.success'
-]
-
-BASIC_NOTIFICATIONS_PORT = [
-    'baremetal.port.create.success',
-    'baremetal.port.delete.success'
-]
-
-BASIC_NOTIFICATIONS_CHASSIS = [
-    'baremetal.chassis.create.success',
-    'baremetal.chassis.delete.success'
-]
-
+CREATE = 'create'
+POWER_STATE = 'power-state'
+PROVISION_STATE = 'provision-state'
+MAINTENANCE = 'maintenance'
+DELETE = 'delete'
+UPDATE = 'update'
 
 def get_url(conf):
     conf = conf.oslo_messaging_rabbit
@@ -49,6 +34,8 @@ def get_url(conf):
                                             conf.rabbit_password,
                                             conf.rabbit_host,
                                             conf.rabbit_port)
+
+
 class NotificationHandler(object):
 
     def __init__(self, uuid):
@@ -69,39 +56,96 @@ class NotificationHandler(object):
         return self._notifications
 
 
+@ddt.ddt
 class BaremetalNotifications(BaseBaremetalTest):
     '''Tests for ironic notifications'''
 
     def setUp(self):
         super(BaremetalNotifications, self).setUp()
+        self._expected_notifications = None
         self.exchange = kombu.Exchange('ironic', 'topic', durable=False)
-        queue = kombu.Queue(exchange=self.exchange,
-                            routing_key='ironic_versioned_notifications.info',
-                            exclusive=True)
         self.conn = kombu.Connection(get_url(
             transport.get_transport(cfg.CONF).conf))
         self.channel = self.conn.channel()
-        self.queue = queue(self.channel)
-        self.queue.declare()
 
     @classmethod
     def setup_clients(cls):
         super(BaremetalNotifications, cls).setup_clients()
         cls.baremetal_client = clients.Manager().baremetal_client
 
-    def test_baremetal_notifications_node(self):
-        resp, node = self.create_node(None)
-        provision_states_list = ['active', 'deleted']
-        instance_uuid = data_utils.rand_uuid()
-        self.baremetal_client.update_node(node['uuid'],
-                                          instance_uuid=instance_uuid)
-        self.baremetal_client.set_node_power_state(node['uuid'], 'power off')
-        for provision_state in provision_states_list:
-            self.baremetal_client.set_node_provision_state(node['uuid'],
-            provision_state)
-        self.baremetal_client.set_maintenance(node['uuid'])
-        self.delete_node(node['uuid'])
-        handler = NotificationHandler(node['uuid'])
+    def _define_queue(self, action_type):
+        key_level = 'info'
+        if action_type == UPDATE:
+            key_level = 'debug'
+        routing_key = 'ironic_versioned_notifications.{}'.format(key_level)
+
+        queue = kombu.Queue(exchange=self.exchange,
+                            routing_key=routing_key,
+                            exclusive=True)
+        self.queue = queue(self.channel)
+        self.queue.declare()
+
+    @ddt.data(CREATE,
+              POWER_STATE,
+              PROVISION_STATE,
+              MAINTENANCE,
+              DELETE,
+              UPDATE)
+    def test_baremetal_notifications_node(self, action_type):
+        self._define_queue(action_type)
+        _, node = self.create_node(None)
+        self._do_action(node['uuid'], action_type)
+        notifications = self._capture_notifications(node['uuid'])
+        self.assertSequenceIn(self._expected_notifications, notifications)
+
+    def assertSequenceIn(self, expected, actual):
+        expected = list(expected)
+        actual = list(actual)
+
+        absent = []
+        for e in expected:
+            if e not in actual:
+                absent.append(e)
+
+        assert not absent, "There are absent elements: {}".format(absent)
+
+    def _do_action(self, node_uuid, action_type):
+        if action_type == CREATE:
+            self._expected_notifications = ['baremetal.node.create.success']
+
+        elif action_type == POWER_STATE:
+            self.baremetal_client.set_node_power_state(node_uuid,
+                                                       'power off')
+            self._expected_notifications = ['baremetal.node.power_set.start',
+                                            'baremetal.node.power_set.end']
+
+        elif action_type == PROVISION_STATE:
+            for provision_state in ['active', 'deleted']:
+                self.baremetal_client.set_node_provision_state(node_uuid,
+                                                               provision_state)
+            self._expected_notifications = ['baremetal.node.provision_set.start',
+                                            'baremetal.node.provision_set.end']
+
+        elif action_type == MAINTENANCE:
+            self.baremetal_client.set_maintenance(node_uuid)
+            self._expected_notifications = ['baremetal.node.maintenance_set.success']
+
+        elif action_type == DELETE:
+            self.delete_node(node_uuid)
+            self._expected_notifications = ['baremetal.node.delete.success']
+
+        elif action_type == UPDATE:
+            self.baremetal_client.update_node(
+                node_uuid, instance_uuid=data_utils.rand_uuid())
+            self.addCleanup(self.baremetal_client.update_node, uuid=node_uuid,
+                            instance_uuid=None)
+            self._expected_notifications = ['baremetal.node.update.success']
+
+        else:
+            raise Exception("Undefined action type {!r}".format(action_type))
+
+    def _capture_notifications(self, object_uuid):
+        handler = NotificationHandler(object_uuid)
 
         with self.conn.Consumer(self.queue,
                                 callbacks=[handler.process_message],
@@ -111,55 +155,5 @@ class BaremetalNotifications(BaseBaremetalTest):
                     self.conn.drain_events(timeout=1)
             except socket.timeout:
                 pass
-        print handler.notifications
-        for notification in BASIC_NOTIFICATIONS_NODE:
-            self.assertIn(notification, handler.notifications)
 
-    def test_baremetal_notifications_chassis(self):
-        resp, chassis = self.create_chassis()
-        new_description = data_utils.rand_name('new-description')
-        self.baremetal_client.update_chassis(chassis['uuid'],
-                                             description=new_description)
-        self.baremetal_client.delete_chassis(chassis['uuid'])
-
-        handler = NotificationHandler(chassis['uuid'])
-
-        with self.conn.Consumer(self.queue,
-                                callbacks=[handler.process_message],
-                                auto_declare=False):
-            try:
-                while True:
-                    self.conn.drain_events(timeout=1)
-            except socket.timeout:
-                pass
-
-        for notification in BASIC_NOTIFICATIONS_CHASSIS:
-            self.assertIn(notification, handler.notifications)
-
-    def test_baremetal_notifications_port(self):
-        resp_node, node = self.create_node(None)
-        resp, port = self.create_port(node['uuid'],
-                                      data_utils.rand_mac_address())
-        patch = [{'path': '/extra/key1',
-                  'op': 'add',
-                  'value': {'key1': 'value1'}}]
-        self.baremetal_client.update_port(port['uuid'], patch)
-        self.delete_port(port['uuid'])
-
-        handler = NotificationHandler(port['uuid'])
-
-        with self.conn.Consumer(self.queue,
-                                callbacks=[handler.process_message],
-                                auto_declare=False):
-            try:
-                while True:
-                    self.conn.drain_events(timeout=1)
-            except socket.timeout:
-                pass
-        print handler.notifications
-        for notification in BASIC_NOTIFICATIONS_PORT:
-            self.assertIn(notification, handler.notifications)
-
-    def test_baremetal_notifications_test(self):
-        resp, node = self.create_node(None)
-        self.baremetal_client.set_maintenance(node['uuid'])
+        return handler.notifications
